@@ -15,6 +15,10 @@
 #include "mem_hook.h"
 
 #include <iostream>
+#ifdef __APPLE__
+#include <cstring>
+#include <malloc/malloc.h>
+#endif
 
 #include "base/failpoint/fail_point.h"
 #include "common/compiler_util.h"
@@ -198,6 +202,24 @@ void my_free(void* p) STARROCKS_MEM_HOOK_THROW_SPEC {
         RESET_DELTA_MEMORY();
         return;
     }
+#ifdef __APPLE__
+    // On macOS, system libraries (e.g. libc++abi.dylib) may allocate memory via the
+    // system malloc zone due to two-level namespace binding, while our hook redirects
+    // free() to jemalloc. We use the system default zone's size() callback to check
+    // if a pointer was allocated by the system allocator. If so, free it via the
+    // system zone to avoid cross-allocator crashes.
+    //
+    // Note: we cannot use je_malloc_usable_size() for detection because jemalloc's
+    // ivsalloc() may produce false positives on system-allocated pointers.
+    {
+        static malloc_zone_t* sys_default_zone = malloc_default_zone();
+        if (UNLIKELY(sys_default_zone->size(sys_default_zone, p) != 0)) {
+            malloc_zone_free(sys_default_zone, p);
+            RESET_DELTA_MEMORY();
+            return;
+        }
+    }
+#endif
     int64_t malloc_size = STARROCKS_MALLOC_SIZE(p);
     MEMORY_RELEASE_SIZE(malloc_size);
     SET_DELTA_MEMORY(-malloc_size);
@@ -214,6 +236,29 @@ void* my_realloc(void* p, size_t size) STARROCKS_MEM_HOOK_THROW_SPEC {
         RESET_DELTA_MEMORY();
         return nullptr;
     }
+#ifdef __APPLE__
+    // If the old pointer was allocated by the system zone (not jemalloc),
+    // we cannot pass it to je_realloc. Instead, allocate new memory via jemalloc,
+    // copy the old contents, and free via the system zone.
+    if (p != nullptr) {
+        static malloc_zone_t* sys_default_zone = malloc_default_zone();
+        size_t sys_size = sys_default_zone->size(sys_default_zone, p);
+        if (UNLIKELY(sys_size != 0)) {
+            void* new_ptr = STARROCKS_MALLOC(size);
+            if (LIKELY(new_ptr != nullptr)) {
+                size_t copy_size = sys_size < size ? sys_size : size;
+                memcpy(new_ptr, p, copy_size);
+                int64_t alloc_size = STARROCKS_NALLOX(size, 0);
+                MEMORY_CONSUME_SIZE(alloc_size);
+                SET_DELTA_MEMORY(alloc_size);
+            } else {
+                RESET_DELTA_MEMORY();
+            }
+            malloc_zone_free(sys_default_zone, p);
+            return new_ptr;
+        }
+    }
+#endif
     int64_t old_size = STARROCKS_MALLOC_SIZE(p);
     int64_t new_size = STARROCKS_NALLOX(size, 0);
     SET_DELTA_MEMORY(new_size - old_size);
@@ -282,6 +327,16 @@ void my_cfree(void* ptr) STARROCKS_MEM_HOOK_THROW_SPEC {
         RESET_DELTA_MEMORY();
         return;
     }
+#ifdef __APPLE__
+    {
+        static malloc_zone_t* sys_default_zone = malloc_default_zone();
+        if (UNLIKELY(sys_default_zone->size(sys_default_zone, ptr) != 0)) {
+            malloc_zone_free(sys_default_zone, ptr);
+            RESET_DELTA_MEMORY();
+            return;
+        }
+    }
+#endif
     int64_t alloc_size = STARROCKS_MALLOC_SIZE(ptr);
     MEMORY_RELEASE_SIZE(alloc_size);
     SET_DELTA_MEMORY(-alloc_size);
